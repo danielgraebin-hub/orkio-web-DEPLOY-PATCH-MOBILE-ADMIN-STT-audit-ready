@@ -9,6 +9,8 @@ import OnboardingModal from "../components/OnboardingModal.jsx";
 import { startSessionHeartbeat } from "../lib/sessionHeartbeat.js";
 
 const ORKIO_ENV = (typeof window !== "undefined" && window.__ORKIO_ENV__) ? window.__ORKIO_ENV__ : {};
+const ORKIO_RUNTIME_MODE = ((ORKIO_ENV.VITE_ORKIO_RUNTIME_MODE || import.meta.env.VITE_ORKIO_RUNTIME_MODE || "summit").trim().toLowerCase() || "summit");
+const REALTIME_INSTITUTIONAL_MODE = ((ORKIO_ENV.VITE_REALTIME_INSTITUTIONAL_MODE || import.meta.env.VITE_REALTIME_INSTITUTIONAL_MODE || (ORKIO_RUNTIME_MODE === "summit" ? "true" : "false")).toString().trim().toLowerCase() !== "false");
 const SUMMIT_VOICE_MODE = ((ORKIO_ENV.VITE_SUMMIT_VOICE_MODE || import.meta.env.VITE_SUMMIT_VOICE_MODE || "realtime").trim().toLowerCase() === "stt_tts")
   ? "stt_tts"
   : "realtime";
@@ -579,7 +581,8 @@ const [onboardingForm, setOnboardingForm] = useState(() => sanitizeOnboardingFor
   const rtcResponseTimeoutRef = useRef(null);
   const rtcFallbackActiveRef = useRef(false);
   const rtcResponseInFlightRef = useRef(false);
-
+  const rtcInstitutionalHandoffInFlightRef = useRef(false);
+  const rtcLastInstitutionalHandoffRef = useRef("");
 
 const rtcIdleFollowupTimerRef = useRef(null);
 const rtcIdleFollowupSentRef = useRef(false);
@@ -599,7 +602,7 @@ const rtcLastUserActivityAtRef = useRef(0);
   const [lastRealtimeSessionId, setLastRealtimeSessionId] = useState(null);
   const [summitSessionScore, setSummitSessionScore] = useState(null);
   const [summitReviewPending, setSummitReviewPending] = useState(false);
-  const summitRuntimeModeRef = useRef((((window.__ORKIO_ENV__?.VITE_ORKIO_RUNTIME_MODE || import.meta.env.VITE_ORKIO_RUNTIME_MODE || "summit")).trim().toLowerCase() === "summit") ? "summit" : "platform");
+  const summitRuntimeModeRef = useRef((ORKIO_RUNTIME_MODE === "summit") ? "summit" : "platform");
   const summitLanguageProfileRef = useRef((((window.__ORKIO_ENV__?.VITE_SUMMIT_LANGUAGE_PROFILE || import.meta.env.VITE_SUMMIT_LANGUAGE_PROFILE || "auto")).trim() || "auto"));
 
 
@@ -1758,6 +1761,7 @@ function markRealtimeUserActivity() {
 function scheduleRealtimeIdleFollowup() {
   clearRealtimeIdleFollowup();
   if (!REALTIME_IDLE_FOLLOWUP_ENABLED) return;
+  if (REALTIME_INSTITUTIONAL_MODE) return;
   if (!realtimeModeRef.current) return;
 
   const assistantAgentId = destSingle || null;
@@ -2135,10 +2139,43 @@ function scheduleRealtimeIdleFollowup() {
 
             Promise.resolve(guardAndMaybeBlockRealtimeTranscript(raw)).then((blocked) => {
               if (blocked) return;
-              setRtcReadyToRespond(!!raw.trim());
-              const norm = raw.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+              const trimmed = raw.trim();
+              setRtcReadyToRespond(!!trimmed);
+              const norm = trimmed.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
               const endsWithCmd = (s, cmd) => s === cmd || s.endsWith(' ' + cmd);
               const isMagic = endsWithCmd(norm, 'continue') || endsWithCmd(norm, 'please') || endsWithCmd(norm, 'prossiga') || endsWithCmd(norm, 'por favor');
+
+              if (REALTIME_INSTITUTIONAL_MODE && trimmed) {
+                if (rtcInstitutionalHandoffInFlightRef.current) {
+                  logRealtimeStep('realtime:handoff_skip_inflight');
+                  return;
+                }
+                if (rtcLastInstitutionalHandoffRef.current === norm) {
+                  logRealtimeStep('realtime:handoff_skip_duplicate');
+                  return;
+                }
+                rtcInstitutionalHandoffInFlightRef.current = true;
+                rtcLastInstitutionalHandoffRef.current = norm;
+                setRtcReadyToRespond(false);
+                setV2vPhase('chat');
+                setUploadStatus('🎙️ Fala detectada — encaminhando ao Orkio...');
+                setTimeout(() => setUploadStatus(''), 1800);
+
+                Promise.resolve(sendMessage(trimmed, {
+                  realtimeTurn: true,
+                  explicitVoiceRequested: true,
+                }))
+                  .catch((err) => {
+                    console.warn('[Realtime] institutional handoff failed', err);
+                    setUploadStatus('❌ Falha ao encaminhar fala ao Orkio.');
+                    setTimeout(() => setUploadStatus(''), 2200);
+                  })
+                  .finally(() => {
+                    rtcInstitutionalHandoffInFlightRef.current = false;
+                  });
+                return;
+              }
+
               if (rtcMagicEnabledRef.current && isMagic) {
                 try {
                   if (rtcLastMagicRef.current !== norm) {
@@ -2148,7 +2185,7 @@ function scheduleRealtimeIdleFollowup() {
                 } catch (err) {
                   console.warn('[Realtime] magic trigger failed', err);
                 }
-              } else if (raw.trim()) {
+              } else if (trimmed) {
                 if (REALTIME_AUTO_RESPONSE_ENABLED) {
                   triggerRealtimeResponse("auto_vad");
                 } else {
@@ -2199,7 +2236,9 @@ function scheduleRealtimeIdleFollowup() {
             rtcResponseInFlightRef.current = false;
             const at = ((rtcAudioTranscriptBufRef.current || '') + (ev?.transcript || '')).trim();
             rtcAudioTranscriptBufRef.current = '';
-            if (!rtcAssistantFinalCommittedRef.current) {
+            if (REALTIME_INSTITUTIONAL_MODE) {
+              logRealtimeStep('response:skip_provider_audio_transcript_final', { hasTranscript: !!at });
+            } else if (!rtcAssistantFinalCommittedRef.current) {
               commitRealtimeAssistantFinal(at, { source: 'response.audio_transcript' });
             }
           }
@@ -2284,6 +2323,13 @@ function scheduleRealtimeIdleFollowup() {
   
   function triggerRealtimeResponse(reason = "manual") {
     try {
+      if (REALTIME_INSTITUTIONAL_MODE) {
+        logRealtimeStep("response:skip_institutional_mode", { reason });
+        setRtcReadyToRespond(false);
+        setUploadStatus("🏛️ Modo institucional ativo — usando orquestração do Orkio.");
+        setTimeout(() => setUploadStatus(""), 1600);
+        return;
+      }
       const dc = rtcDcRef.current;
       if (!dc || dc.readyState !== "open") {
         throw new Error("DataChannel não está aberto");
@@ -2417,6 +2463,7 @@ function scheduleRealtimeIdleFollowup() {
   }
 
   function commitRealtimeAssistantFinal(rawText, { source = 'unknown' } = {}) {
+    if (REALTIME_INSTITUTIONAL_MODE) return;
     const finalText = (rawText || '').toString().trim();
     if (!finalText) return;
     const dedupeKey = finalText.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
