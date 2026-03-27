@@ -4046,14 +4046,4 @@ async function stopRealtime(reason = 'client_stop') {
     </>
   );
 }
-      {isMobile ? (
-        <button
-          type="button"
-          onClick={createThread}
-          style={styles.mobileFab}
-          title="Nova conversa"
-        >
-          +
-        </button>
-      ) : null}
 
