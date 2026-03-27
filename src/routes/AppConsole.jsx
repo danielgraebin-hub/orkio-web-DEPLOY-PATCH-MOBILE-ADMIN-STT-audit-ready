@@ -9,8 +9,6 @@ import OnboardingModal from "../components/OnboardingModal.jsx";
 import { startSessionHeartbeat } from "../lib/sessionHeartbeat.js";
 
 const ORKIO_ENV = (typeof window !== "undefined" && window.__ORKIO_ENV__) ? window.__ORKIO_ENV__ : {};
-const ORKIO_RUNTIME_MODE = ((ORKIO_ENV.VITE_ORKIO_RUNTIME_MODE || import.meta.env.VITE_ORKIO_RUNTIME_MODE || "summit").trim().toLowerCase() || "summit");
-const REALTIME_INSTITUTIONAL_MODE = ((ORKIO_ENV.VITE_REALTIME_INSTITUTIONAL_MODE || import.meta.env.VITE_REALTIME_INSTITUTIONAL_MODE || (ORKIO_RUNTIME_MODE === "summit" ? "true" : "false")).toString().trim().toLowerCase() !== "false");
 const SUMMIT_VOICE_MODE = ((ORKIO_ENV.VITE_SUMMIT_VOICE_MODE || import.meta.env.VITE_SUMMIT_VOICE_MODE || "realtime").trim().toLowerCase() === "stt_tts")
   ? "stt_tts"
   : "realtime";
@@ -26,6 +24,7 @@ const REALTIME_IDLE_FOLLOWUP_MS = Math.max(5000, Number(ORKIO_ENV.VITE_REALTIME_
 const REALTIME_REARM_AFTER_ASSISTANT_MS = Math.max(800, Number(ORKIO_ENV.VITE_REALTIME_RESTART_AFTER_TTS_MS || import.meta.env.VITE_REALTIME_RESTART_AFTER_TTS_MS || 1800) || 1800);
 
 const REALTIME_AUTO_RESPONSE_ENABLED = ((ORKIO_ENV.VITE_REALTIME_AUTO_RESPONSE_ENABLED || import.meta.env.VITE_REALTIME_AUTO_RESPONSE_ENABLED || "true").toString().trim().toLowerCase() !== "false");
+const REALTIME_INSTITUTIONAL_MODE = (((ORKIO_ENV.VITE_REALTIME_INSTITUTIONAL_MODE || import.meta.env.VITE_REALTIME_INSTITUTIONAL_MODE || ORKIO_ENV.VITE_ORKIO_RUNTIME_MODE || import.meta.env.VITE_ORKIO_RUNTIME_MODE || "summit")).toString().trim().toLowerCase() === "summit");
 const REALTIME_SERVER_VAD_THRESHOLD = Math.min(0.99, Math.max(0.1, Number(ORKIO_ENV.VITE_REALTIME_VAD_THRESHOLD || import.meta.env.VITE_REALTIME_VAD_THRESHOLD || 0.78) || 0.78));
 const REALTIME_SERVER_VAD_SILENCE_MS = Math.max(250, Number(ORKIO_ENV.VITE_REALTIME_VAD_SILENCE_MS || import.meta.env.VITE_REALTIME_VAD_SILENCE_MS || 1100) || 1100);
 const REALTIME_SERVER_VAD_PREFIX_MS = Math.max(0, Number(ORKIO_ENV.VITE_REALTIME_VAD_HOLD_MS || import.meta.env.VITE_REALTIME_VAD_HOLD_MS || 220) || 220);
@@ -581,8 +580,7 @@ const [onboardingForm, setOnboardingForm] = useState(() => sanitizeOnboardingFor
   const rtcResponseTimeoutRef = useRef(null);
   const rtcFallbackActiveRef = useRef(false);
   const rtcResponseInFlightRef = useRef(false);
-  const rtcInstitutionalHandoffInFlightRef = useRef(false);
-  const rtcLastInstitutionalHandoffRef = useRef("");
+
 
 const rtcIdleFollowupTimerRef = useRef(null);
 const rtcIdleFollowupSentRef = useRef(false);
@@ -602,7 +600,7 @@ const rtcLastUserActivityAtRef = useRef(0);
   const [lastRealtimeSessionId, setLastRealtimeSessionId] = useState(null);
   const [summitSessionScore, setSummitSessionScore] = useState(null);
   const [summitReviewPending, setSummitReviewPending] = useState(false);
-  const summitRuntimeModeRef = useRef((ORKIO_RUNTIME_MODE === "summit") ? "summit" : "platform");
+  const summitRuntimeModeRef = useRef((((window.__ORKIO_ENV__?.VITE_ORKIO_RUNTIME_MODE || import.meta.env.VITE_ORKIO_RUNTIME_MODE || "summit")).trim().toLowerCase() === "summit") ? "summit" : "platform");
   const summitLanguageProfileRef = useRef((((window.__ORKIO_ENV__?.VITE_SUMMIT_LANGUAGE_PROFILE || import.meta.env.VITE_SUMMIT_LANGUAGE_PROFILE || "auto")).trim() || "auto"));
 
 
@@ -1250,42 +1248,161 @@ useEffect(() => {
       setV2vPhase('chat');
       setV2vError(null);
 
-      // SAFE CHAT MODE: temporarily bypass SSE streaming and use JSON chat only.
-      // This avoids stream/parser/proxy issues and prioritizes reliable agent responses for Summit.
+      const shouldUseStream = !!opts?.useStream || !!opts?.realtimeTurn;
       let resp = null;
       let newThreadId = threadId;
+      let freshMessages = null;
+      let streamLastAgentInfo = null;
 
-      resp = await chat({
-        token,
-        org: tenant,
-        thread_id: threadId,
-        message: finalMsg,
-        agent_id: agentIdToSend,
-        trace_id: traceId,
-        client_message_id: clientMessageId,
-        signal: ctl.signal,
-      });
+      if (shouldUseStream) {
+        const streamResp = await chatStream({
+          token,
+          org: tenant,
+          thread_id: threadId,
+          message: finalMsg,
+          agent_id: agentIdToSend,
+          trace_id: traceId,
+          client_message_id: clientMessageId,
+          signal: ctl.signal,
+        });
 
-      if (resp?.status === 429) {
-        closeCapacityModal();
-        openCapacityModal(msg);
-        return;
-      }
+        const reader = streamResp?.body?.getReader?.();
+        const decoder = new TextDecoder();
+        let sseBuffer = "";
+        const streamDraftByAgent = new Map();
 
-       // V2V-PATCH: se fallback /api/chat criou thread, capturar thread_id do resp
-       if (resp?.data?.thread_id) newThreadId = resp.data.thread_id;
-      // F-03 FIX: usar newThreadId (var local) em vez de threadId (closure stale do React)
-      // Se a conversa foi criada durante o SSE stream, threadId ainda aponta para a thread antiga
-      const effectiveTidForLoad = newThreadId || threadId;
-      if (effectiveTidForLoad && effectiveTidForLoad !== threadId) {
-        setThreadId(effectiveTidForLoad);
-      }
-      const freshMessages = await loadMessages(effectiveTidForLoad);
+        const applyStreamDraft = (agentId, agentName, content) => {
+          const safeAgentId = String(agentId || "orkio");
+          const safeAgentName = agentName || "Orkio";
+          setMessages((prev) => {
+            const list = Array.isArray(prev) ? [...prev] : [];
+            const idx = list.findIndex((m) => m?.id === `tmp-stream-${safeAgentId}`);
+            const draft = {
+              id: `tmp-stream-${safeAgentId}`,
+              role: "assistant",
+              content: content || "⌛ Preparando resposta...",
+              agent_id: agentId || null,
+              agent_name: safeAgentName,
+              created_at: Math.floor(Date.now() / 1000),
+            };
+            if (idx >= 0) list[idx] = draft;
+            else list.push(draft);
+            return list;
+          });
+        };
 
-      // PATCH0100_14: store agent info from response
-      if (resp?.data) {
-        const ai = { agent_id: resp.data.agent_id, agent_name: resp.data.agent_name, voice_id: resp.data.voice_id, avatar_url: resp.data.avatar_url };
-        setLastAgentInfo(ai);
+        const processSseBlock = (block) => {
+          const lines = String(block || "").split(/\r?\n/);
+          let eventName = "message";
+          let dataText = "";
+          for (const line of lines) {
+            if (line.startsWith("event:")) eventName = line.slice(6).trim();
+            if (line.startsWith("data:")) dataText += line.slice(5).trim();
+          }
+          if (!dataText) return false;
+          let payload = null;
+          try { payload = JSON.parse(dataText); } catch { return false; }
+
+          if (payload?.thread_id) newThreadId = payload.thread_id;
+          if (payload?.agent_id || payload?.agent_name) {
+            streamLastAgentInfo = {
+              agent_id: payload?.agent_id || null,
+              agent_name: payload?.agent_name || "Orkio",
+              voice_id: payload?.voice_id || null,
+              avatar_url: payload?.avatar_url || null,
+            };
+          }
+
+          if (eventName === "status") {
+            const who = payload?.agent_name || payload?.label || "agente";
+            try { setUploadStatus(`🤖 ${who} pensando...`); } catch {}
+            return false;
+          }
+
+          if (eventName === "chunk") {
+            const aid = String(payload?.agent_id || "orkio");
+            const current = streamDraftByAgent.get(aid) || "";
+            const next = current + String(payload?.delta || payload?.content || "");
+            streamDraftByAgent.set(aid, next);
+            applyStreamDraft(payload?.agent_id || null, payload?.agent_name || "Orkio", next);
+            return false;
+          }
+
+          if (eventName === "agent_done") {
+            return false;
+          }
+
+          if (eventName === "done") {
+            return true;
+          }
+
+          if (eventName === "error") {
+            const err = new Error(payload?.message || payload?.error || "stream error");
+            err.status = payload?.status || 500;
+            throw err;
+          }
+
+          return false;
+        };
+
+        if (reader) {
+          while (true) {
+            const { value, done } = await reader.read();
+            if (done) break;
+            sseBuffer += decoder.decode(value, { stream: true });
+            const blocks = sseBuffer.split(/\r?\n\r?\n/);
+            sseBuffer = blocks.pop() || "";
+            for (const block of blocks) {
+              if (isStale()) return;
+              const reachedDone = processSseBlock(block);
+              if (reachedDone) break;
+            }
+          }
+        }
+
+        if (sseBuffer.trim()) {
+          try { processSseBlock(sseBuffer); } catch (streamErr) { throw streamErr; }
+        }
+
+        const effectiveTidForLoad = newThreadId || threadId;
+        if (effectiveTidForLoad && effectiveTidForLoad !== threadId) {
+          setThreadId(effectiveTidForLoad);
+        }
+        freshMessages = await loadMessages(effectiveTidForLoad);
+        if (streamLastAgentInfo) {
+          setLastAgentInfo(streamLastAgentInfo);
+        }
+      } else {
+        resp = await chat({
+          token,
+          org: tenant,
+          thread_id: threadId,
+          message: finalMsg,
+          agent_id: agentIdToSend,
+          trace_id: traceId,
+          client_message_id: clientMessageId,
+          signal: ctl.signal,
+        });
+
+        if (resp?.status === 429) {
+          closeCapacityModal();
+          openCapacityModal(msg);
+          return;
+        }
+
+         // V2V-PATCH: se fallback /api/chat criou thread, capturar thread_id do resp
+         if (resp?.data?.thread_id) newThreadId = resp.data.thread_id;
+        const effectiveTidForLoad = newThreadId || threadId;
+        if (effectiveTidForLoad && effectiveTidForLoad !== threadId) {
+          setThreadId(effectiveTidForLoad);
+        }
+        freshMessages = await loadMessages(effectiveTidForLoad);
+
+        // PATCH0100_14: store agent info from response
+        if (resp?.data) {
+          const ai = { agent_id: resp.data.agent_id, agent_name: resp.data.agent_name, voice_id: resp.data.voice_id, avatar_url: resp.data.avatar_url };
+          setLastAgentInfo(ai);
+        }
       }
       // V2V-PATCH: Auto-play TTS — fase TTS + fase playing com trace_id
       if (voiceModeRef.current) {
@@ -1760,8 +1877,8 @@ function markRealtimeUserActivity() {
 
 function scheduleRealtimeIdleFollowup() {
   clearRealtimeIdleFollowup();
-  if (!REALTIME_IDLE_FOLLOWUP_ENABLED) return;
   if (REALTIME_INSTITUTIONAL_MODE) return;
+  if (!REALTIME_IDLE_FOLLOWUP_ENABLED) return;
   if (!realtimeModeRef.current) return;
 
   const assistantAgentId = destSingle || null;
@@ -2139,43 +2256,10 @@ function scheduleRealtimeIdleFollowup() {
 
             Promise.resolve(guardAndMaybeBlockRealtimeTranscript(raw)).then((blocked) => {
               if (blocked) return;
-              const trimmed = raw.trim();
-              setRtcReadyToRespond(!!trimmed);
-              const norm = trimmed.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
+              setRtcReadyToRespond(!!raw.trim());
+              const norm = raw.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase().trim();
               const endsWithCmd = (s, cmd) => s === cmd || s.endsWith(' ' + cmd);
               const isMagic = endsWithCmd(norm, 'continue') || endsWithCmd(norm, 'please') || endsWithCmd(norm, 'prossiga') || endsWithCmd(norm, 'por favor');
-
-              if (REALTIME_INSTITUTIONAL_MODE && trimmed) {
-                if (rtcInstitutionalHandoffInFlightRef.current) {
-                  logRealtimeStep('realtime:handoff_skip_inflight');
-                  return;
-                }
-                if (rtcLastInstitutionalHandoffRef.current === norm) {
-                  logRealtimeStep('realtime:handoff_skip_duplicate');
-                  return;
-                }
-                rtcInstitutionalHandoffInFlightRef.current = true;
-                rtcLastInstitutionalHandoffRef.current = norm;
-                setRtcReadyToRespond(false);
-                setV2vPhase('chat');
-                setUploadStatus('🎙️ Fala detectada — encaminhando ao Orkio...');
-                setTimeout(() => setUploadStatus(''), 1800);
-
-                Promise.resolve(sendMessage(trimmed, {
-                  realtimeTurn: true,
-                  explicitVoiceRequested: true,
-                }))
-                  .catch((err) => {
-                    console.warn('[Realtime] institutional handoff failed', err);
-                    setUploadStatus('❌ Falha ao encaminhar fala ao Orkio.');
-                    setTimeout(() => setUploadStatus(''), 2200);
-                  })
-                  .finally(() => {
-                    rtcInstitutionalHandoffInFlightRef.current = false;
-                  });
-                return;
-              }
-
               if (rtcMagicEnabledRef.current && isMagic) {
                 try {
                   if (rtcLastMagicRef.current !== norm) {
@@ -2185,8 +2269,14 @@ function scheduleRealtimeIdleFollowup() {
                 } catch (err) {
                   console.warn('[Realtime] magic trigger failed', err);
                 }
-              } else if (trimmed) {
-                if (REALTIME_AUTO_RESPONSE_ENABLED) {
+              } else if (raw.trim()) {
+                if (REALTIME_INSTITUTIONAL_MODE) {
+                  sendMessage(raw, {
+                    realtimeTurn: true,
+                    explicitVoiceRequested: true,
+                    useStream: true,
+                  });
+                } else if (REALTIME_AUTO_RESPONSE_ENABLED) {
                   triggerRealtimeResponse("auto_vad");
                 } else {
                   setUploadStatus('Ready to respond — click ▶️ or press Space/Enter.');
@@ -2221,7 +2311,9 @@ function scheduleRealtimeIdleFollowup() {
             const t = (rtcTextBufRef.current || '').trim();
             rtcTextBufRef.current = '';
             rtcAudioTranscriptBufRef.current = '';
-            commitRealtimeAssistantFinal(t, { source: 'response.text.done' });
+            if (!REALTIME_INSTITUTIONAL_MODE) {
+              commitRealtimeAssistantFinal(t, { source: 'response.text.done' });
+            }
           }
           // Audio transcript (when model outputs audio without text)
           if (ev?.type === 'response.audio.delta') {
@@ -2236,9 +2328,7 @@ function scheduleRealtimeIdleFollowup() {
             rtcResponseInFlightRef.current = false;
             const at = ((rtcAudioTranscriptBufRef.current || '') + (ev?.transcript || '')).trim();
             rtcAudioTranscriptBufRef.current = '';
-            if (REALTIME_INSTITUTIONAL_MODE) {
-              logRealtimeStep('response:skip_provider_audio_transcript_final', { hasTranscript: !!at });
-            } else if (!rtcAssistantFinalCommittedRef.current) {
+            if (!REALTIME_INSTITUTIONAL_MODE && !rtcAssistantFinalCommittedRef.current) {
               commitRealtimeAssistantFinal(at, { source: 'response.audio_transcript' });
             }
           }
@@ -2324,10 +2414,7 @@ function scheduleRealtimeIdleFollowup() {
   function triggerRealtimeResponse(reason = "manual") {
     try {
       if (REALTIME_INSTITUTIONAL_MODE) {
-        logRealtimeStep("response:skip_institutional_mode", { reason });
-        setRtcReadyToRespond(false);
-        setUploadStatus("🏛️ Modo institucional ativo — usando orquestração do Orkio.");
-        setTimeout(() => setUploadStatus(""), 1600);
+        logRealtimeStep("response:blocked_institutional_mode", { reason });
         return;
       }
       const dc = rtcDcRef.current;
@@ -2463,7 +2550,6 @@ function scheduleRealtimeIdleFollowup() {
   }
 
   function commitRealtimeAssistantFinal(rawText, { source = 'unknown' } = {}) {
-    if (REALTIME_INSTITUTIONAL_MODE) return;
     const finalText = (rawText || '').toString().trim();
     if (!finalText) return;
     const dedupeKey = finalText.normalize('NFD').replace(/[\u0300-\u036f]/g, '').toLowerCase();
