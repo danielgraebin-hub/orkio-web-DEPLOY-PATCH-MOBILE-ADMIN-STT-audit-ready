@@ -12,6 +12,8 @@ const ORKIO_ENV = (typeof window !== "undefined" && window.__ORKIO_ENV__) ? wind
 const SUMMIT_VOICE_MODE = ((ORKIO_ENV.VITE_SUMMIT_VOICE_MODE || import.meta.env.VITE_SUMMIT_VOICE_MODE || "realtime").trim().toLowerCase() === "stt_tts")
   ? "stt_tts"
   : "realtime";
+const ENABLE_REALTIME = ((ORKIO_ENV.VITE_ENABLE_REALTIME || import.meta.env.VITE_ENABLE_REALTIME || "true").toString().trim().toLowerCase() !== "false");
+const ENABLE_VOICE = ((ORKIO_ENV.VITE_ENABLE_VOICE || import.meta.env.VITE_ENABLE_VOICE || "true").toString().trim().toLowerCase() !== "false");
 const SPEECH_RECOGNITION_LANG = ((ORKIO_ENV.VITE_SPEECH_RECOGNITION_LANG || import.meta.env.VITE_SPEECH_RECOGNITION_LANG || "en-US").trim() || "en-US");
 const ORKIO_SIDEBAR_LOGO = "/Logo Orkio_V2_Transparente.png";
 
@@ -537,15 +539,15 @@ const [onboardingForm, setOnboardingForm] = useState(() => sanitizeOnboardingFor
   const messagesRef = useRef([]); // PATCH0100_20B: keep latest messages for voice-to-voice sequencing
 
   // Voice-to-text (manual toggle)
-  const [speechSupported] = useState(true);
+  const [speechSupported] = useState(typeof window !== "undefined" && !!(window.SpeechRecognition || window.webkitSpeechRecognition));
   const speechRef = useRef(null);
   const [micEnabled, setMicEnabled] = useState(false);
   const micEnabledRef = useRef(false);
   const micRetryRef = useRef({ tries: 0, lastTry: 0 });
 
   // PATCH0100_13: Voice Mode (TTS + auto-send)
-  const [voiceMode, setVoiceMode] = useState(SUMMIT_VOICE_MODE === "stt_tts");
-  const voiceModeRef = useRef(SUMMIT_VOICE_MODE === "stt_tts");
+  const [voiceMode, setVoiceMode] = useState(ENABLE_VOICE && SUMMIT_VOICE_MODE === "stt_tts");
+  const voiceModeRef = useRef(ENABLE_VOICE && SUMMIT_VOICE_MODE === "stt_tts");
   const [ttsPlaying, setTtsPlaying] = useState(false);
   const ttsAudioRef = useRef(null);
   const [ttsVoice, setTtsVoice] = useState(localStorage.getItem('orkio_tts_voice') || 'cedar');
@@ -848,6 +850,11 @@ useEffect(() => {
   }, [isMobile]);
 
   useEffect(() => {
+    if (!ENABLE_VOICE) {
+      setVoiceMode(false);
+      voiceModeRef.current = false;
+      return;
+    }
     if (SUMMIT_VOICE_MODE === "stt_tts") {
       setVoiceMode(true);
       voiceModeRef.current = true;
@@ -1383,7 +1390,7 @@ useEffect(() => {
     setV2vError(null);
 
     // ── Caminho 1: MediaRecorder (todos os browsers modernos, qualidade superior) ──
-    if (mediaRecorderSupported && voiceModeRef.current) {
+    if (mediaRecorderSupported) {
       navigator.mediaDevices.getUserMedia(buildPreferredMicConstraints())
         .then(async (stream) => {
           if (!micEnabledRef.current) {
@@ -1470,15 +1477,17 @@ useEffect(() => {
                 return;
               }
 
-              setText(text);
+              const finalTranscript = text;
+              setText(finalTranscript);
               setV2vPhase('chat');
-              setUploadStatus(`🎙️ "${text.slice(0, 50)}${text.length > 50 ? '…' : ''}"`);
 
               if (micEnabledRef.current) {
                 micEnabledRef.current = false;
                 setMicEnabled(false);
               }
-              setUploadStatus(`🎙️ "${text.slice(0, 50)}${text.length > 50 ? '…' : ''}" — revise e toque em enviar.`);
+
+              setUploadStatus(`🎙️ "${finalTranscript.slice(0, 50)}${finalTranscript.length > 50 ? '…' : ''}" — enviando...`);
+              sendMessage(finalTranscript);
               setTimeout(() => setUploadStatus(""), 2800);
             } catch (e) {
               console.error('[V2V] v2v_stt_fail trace_id=%s error:', trace, e);
@@ -1595,7 +1604,7 @@ useEffect(() => {
             try { rec.stop(); } catch {}
             micEnabledRef.current = false;
             setMicEnabled(false);
-            sendMessage();
+            sendMessage(toSend);
           }
         }, 1500);
       }
@@ -1626,15 +1635,25 @@ useEffect(() => {
   }
 
   function toggleMic() {
-    if (SUMMIT_VOICE_MODE !== "stt_tts") return;
+    if (!ENABLE_VOICE) return;
     if (!mediaRecorderSupported && !speechSupported) return;
-    if (micEnabled) stopMic();
-    else startMic();
+    if (micEnabled) {
+      stopMic();
+      return;
+    }
+    if (realtimeModeRef.current) {
+      void stopRealtime("voice_manual_selected");
+      setRealtimeMode(false);
+      realtimeModeRef.current = false;
+    }
+    setVoiceMode(true);
+    voiceModeRef.current = true;
+    startMic();
   }
 
   // PATCH0100_13: Voice Mode helpers
   function toggleVoiceMode() {
-    if (SUMMIT_VOICE_MODE !== "stt_tts") return;
+    if (!ENABLE_VOICE) return;
     const next = !voiceMode;
     if (next && realtimeModeRef.current) {
       void stopRealtime('voice_mode_selected');
@@ -2560,7 +2579,7 @@ async function stopRealtime(reason = 'client_stop') {
   }
 
   function toggleRealtimeMode() {
-    if (SUMMIT_VOICE_MODE !== "realtime") return;
+    if (!ENABLE_REALTIME) return;
     const next = !realtimeMode;
     setRealtimeMode(next);
     realtimeModeRef.current = next;
@@ -3489,7 +3508,7 @@ async function stopRealtime(reason = 'client_stop') {
               disabled={sending}
             />
 
-            {SUMMIT_VOICE_MODE === "stt_tts" ? (
+            {ENABLE_VOICE ? (
               <button
                 type="button"
                 style={{ ...styles.micBtn, opacity: (mediaRecorderSupported || speechSupported) ? 1 : 0.55 }}
@@ -3498,7 +3517,9 @@ async function stopRealtime(reason = 'client_stop') {
               >
                 🎙️
               </button>
-            ) : (
+            ) : null}
+
+            {ENABLE_REALTIME ? (
               <button
                 type="button"
                 style={{
@@ -3515,7 +3536,7 @@ async function stopRealtime(reason = 'client_stop') {
                 <span style={{ fontSize: "16px" }}>⚡</span>
                 {realtimeMode && <span style={{ position: "absolute", top: "-2px", right: "-2px", width: "8px", height: "8px", borderRadius: "50%", background: "#50a0ff", animation: "pulse 1.5s infinite" }} />}
               </button>
-            )}
+            ) : null}
 
             {!isMobile && realtimeMode && SUMMIT_VOICE_MODE === "realtime" ? (
               <button
@@ -3567,7 +3588,7 @@ async function stopRealtime(reason = 'client_stop') {
           </div>
 
           {/* Voice Mode controls — PATCH0100_14 enhanced */}
-          {voiceMode && SUMMIT_VOICE_MODE === "stt_tts" && !isMobile && (
+          {voiceMode && ENABLE_VOICE && !isMobile && (
             <div style={{ display: "flex", alignItems: "center", gap: "8px", padding: "4px 8px", fontSize: "12px", color: "rgba(255,255,255,0.7)", flexWrap: "wrap" }}>
               {lastAgentInfo?.avatar_url && (
                 <img src={lastAgentInfo.avatar_url} alt="" style={{ width: 24, height: 24, borderRadius: "50%", objectFit: "cover" }} onError={(e) => { e.target.style.display = 'none'; }} />
