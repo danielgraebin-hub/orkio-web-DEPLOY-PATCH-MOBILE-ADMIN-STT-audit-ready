@@ -611,10 +611,10 @@ export default function AuthPage() {
       });
 
       if (data?.pending_otp) {
-        setOtpMode(false);
-        setPendingEmail("");
+        setOtpMode(true);
+        setPendingEmail(emailNormalized);
         setOtpCode("");
-        setStatus("Password-only login is enabled for this demo. Please redeploy the backend patch that disables OTP in /api/auth/login.");
+        setStatus("We sent a verification code to your email. Enter it to continue.");
         return;
       }
 
